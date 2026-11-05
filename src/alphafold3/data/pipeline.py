@@ -24,6 +24,7 @@ import dataclasses
 import datetime
 import functools
 import logging
+import os
 import time
 
 from alphafold3.common import folding_input
@@ -31,8 +32,13 @@ from alphafold3.constants import mmcif_names
 from alphafold3.data import msa
 from alphafold3.data import msa_config
 from alphafold3.data import structure_stores
+from alphafold3.data.tools import mmseqs as mmseqs_lib
 from alphafold3.data import templates as templates_lib
 from etils import epath
+
+
+def _binary_exists(path: str | None) -> bool:
+  return bool(path) and os.path.exists(path)
 
 
 # Cache to avoid re-running template search for the same sequence in homomers.
@@ -81,43 +87,39 @@ def _get_protein_templates(
 def _get_protein_msa_and_templates(
     sequence: str,
     run_template_search: bool,
-    uniref90_msa_config: msa_config.RunConfig,
-    mgnify_msa_config: msa_config.RunConfig,
-    small_bfd_msa_config: msa_config.RunConfig,
-    uniprot_msa_config: msa_config.RunConfig,
+    uniref90_msa_config: msa_config.RunConfig | None,
+    mgnify_msa_config: msa_config.RunConfig | None,
+    small_bfd_msa_config: msa_config.RunConfig | None,
+    uniprot_msa_config: msa_config.RunConfig | None,
     templates_config: msa_config.TemplatesConfig,
     pdb_database_path: epath.PathLike,
 ) -> tuple[msa.Msa, msa.Msa, templates_lib.Templates]:
-  """Processes a single protein chain."""
+  """Processes a single protein chain.
+
+  A `None` MSA run config (only possible with the MMseqs2 backend) yields an
+  MSA holding just the query.
+  """
   logging.info('Getting protein MSAs for sequence %s', sequence)
   msa_start_time = time.time()
+
+  def _get_msa_or_empty(run_config: msa_config.RunConfig | None) -> msa.Msa:
+    if run_config is None:
+      return msa.Msa.from_empty(
+          query_sequence=sequence, chain_poly_type=mmcif_names.PROTEIN_CHAIN
+      )
+    return msa.get_msa(
+        target_sequence=sequence,
+        run_config=run_config,
+        chain_poly_type=mmcif_names.PROTEIN_CHAIN,
+    )
+
   # Run various MSA tools in parallel. Use a ThreadPoolExecutor because
   # they're not blocked by the GIL, as they're sub-shelled out.
   with futures.ThreadPoolExecutor(max_workers=4) as executor:
-    uniref90_msa_future = executor.submit(
-        msa.get_msa,
-        target_sequence=sequence,
-        run_config=uniref90_msa_config,
-        chain_poly_type=mmcif_names.PROTEIN_CHAIN,
-    )
-    mgnify_msa_future = executor.submit(
-        msa.get_msa,
-        target_sequence=sequence,
-        run_config=mgnify_msa_config,
-        chain_poly_type=mmcif_names.PROTEIN_CHAIN,
-    )
-    small_bfd_msa_future = executor.submit(
-        msa.get_msa,
-        target_sequence=sequence,
-        run_config=small_bfd_msa_config,
-        chain_poly_type=mmcif_names.PROTEIN_CHAIN,
-    )
-    uniprot_msa_future = executor.submit(
-        msa.get_msa,
-        target_sequence=sequence,
-        run_config=uniprot_msa_config,
-        chain_poly_type=mmcif_names.PROTEIN_CHAIN,
-    )
+    uniref90_msa_future = executor.submit(_get_msa_or_empty, uniref90_msa_config)
+    mgnify_msa_future = executor.submit(_get_msa_or_empty, mgnify_msa_config)
+    small_bfd_msa_future = executor.submit(_get_msa_or_empty, small_bfd_msa_config)
+    uniprot_msa_future = executor.submit(_get_msa_or_empty, uniprot_msa_config)
   uniref90_msa = uniref90_msa_future.result()
   mgnify_msa = mgnify_msa_future.result()
   small_bfd_msa = small_bfd_msa_future.result()
@@ -300,6 +302,23 @@ class DataPipelineConfig:
 
   max_template_date: datetime.date
 
+  # Optional MMseqs2 backend for protein MSAs. If `mmseqs_binary_path` is set,
+  # the protein MSAs come from MMseqs2 instead of Jackhmmer (the Jackhmmer
+  # binary and databases are then unused). If the HMMER binaries are missing,
+  # template search and RNA MSA search are skipped.
+  mmseqs_binary_path: str | None = None
+  # MMseqs2 UniRef90-like database for the unpaired MSA (required).
+  mmseqs_uniref90_database_path: str | None = None
+  # Optional databases. The paired MSA uses `mmseqs_uniprot_database_path` and
+  # falls back to the UniRef90 database (species taken from `RepID=`).
+  mmseqs_uniprot_database_path: str | None = None
+  mmseqs_mgnify_database_path: str | None = None
+  mmseqs_small_bfd_database_path: str | None = None
+  mmseqs_gpu: bool = True
+  mmseqs_n_cpu: int = 0
+  mmseqs_sensitivity: float = 7.5
+  mmseqs_cache_dir: str | None = None
+
 
 class DataPipeline:
   """Runs the alignment tools and assembles the input features."""
@@ -380,6 +399,12 @@ class DataPipeline:
         chain_poly_type=mmcif_names.PROTEIN_CHAIN,
         crop_size=None,
     )
+    self._mmseqs = data_pipeline_config.mmseqs_binary_path is not None
+    self._skip_templates = False
+    self._skip_rna = False
+    self._num_protein_chains = 2
+    if self._mmseqs:
+      self._init_mmseqs(data_pipeline_config)
     self._nt_rna_msa_config = msa_config.RunConfig(
         config=msa_config.NhmmerConfig(
             binary_path=data_pipeline_config.nhmmer_binary_path,
@@ -467,6 +492,116 @@ class DataPipeline:
     )
     self._pdb_database_path = data_pipeline_config.pdb_database_path
 
+  def _init_mmseqs(self, config: DataPipelineConfig) -> None:
+    """Replaces the Jackhmmer protein MSA configs with MMseqs2 ones."""
+    if not config.mmseqs_uniref90_database_path:
+      raise ValueError(
+          'mmseqs_uniref90_database_path must be set when using MMseqs2.'
+      )
+
+    cache_dir = config.mmseqs_cache_dir or os.path.join(
+        os.path.expanduser('~'), '.cache', 'alphafold3', 'mmseqs_msa'
+    )
+
+    def _run_config(
+        name: str,
+        path: str | None,
+        max_sequences: int,
+        uniprot_style_headers: bool = False,
+    ) -> msa_config.RunConfig | None:
+      if not path:
+        return None
+      return msa_config.RunConfig(
+          config=msa_config.MMseqsConfig(
+              binary_path=config.mmseqs_binary_path,
+              database_config=msa_config.DatabaseConfig(name=name, path=path),
+              n_cpu=config.mmseqs_n_cpu,
+              max_sequences=max_sequences,
+              sensitivity=config.mmseqs_sensitivity,
+              gpu=config.mmseqs_gpu,
+              uniprot_style_headers=uniprot_style_headers,
+              cache_dir=cache_dir,
+          ),
+          chain_poly_type=mmcif_names.PROTEIN_CHAIN,
+          crop_size=None,
+      )
+
+    self._uniref90_msa_config = _run_config(
+        'uniref90', config.mmseqs_uniref90_database_path, 10_000
+    )
+    self._mgnify_msa_config = _run_config(
+        'mgnify', config.mmseqs_mgnify_database_path, 5_000
+    )
+    self._small_bfd_msa_config = _run_config(
+        'small_bfd', config.mmseqs_small_bfd_database_path, 5_000
+    )
+    self._uniprot_msa_config = _run_config(
+        'uniprot',
+        config.mmseqs_uniprot_database_path
+        or config.mmseqs_uniref90_database_path,
+        50_000,
+        uniprot_style_headers=True,
+    )
+    self._skip_templates = not (
+        _binary_exists(config.hmmsearch_binary_path)
+        and _binary_exists(config.hmmbuild_binary_path)
+    )
+    if self._skip_templates:
+      logging.warning(
+          'hmmsearch/hmmbuild not found: template search is skipped. Install'
+          ' HMMER (e.g. `brew install hmmer`) to enable it.'
+      )
+    self._skip_rna = not all(
+        _binary_exists(path)
+        for path in (
+            config.nhmmer_binary_path,
+            config.hmmalign_binary_path,
+            config.hmmbuild_binary_path,
+        )
+    )
+    if self._skip_rna:
+      logging.warning(
+          'nhmmer/hmmalign/hmmbuild not found: RNA MSA search is skipped.'
+      )
+
+  def prefetch_protein_msas(self, fold_input: folding_input.Input) -> None:
+    """Searches all protein chains of `fold_input` in one MMseqs2 run.
+
+    Loading the database dominates the cost of an MMseqs2 search, so searching
+    all chains together populates the on-disk cache that the per-chain
+    queries then hit. A no-op without the MMseqs2 backend.
+    """
+    if not self._mmseqs:
+      return
+    sequences = [
+        chain.sequence
+        for chain in fold_input.chains
+        if isinstance(chain, folding_input.ProteinChain)
+        and chain.unpaired_msa is None
+        and chain.paired_msa is None
+    ]
+    if not sequences:
+      return
+    multi_chain = len(sequences) > 1
+    for run_config in (
+        self._uniref90_msa_config,
+        self._mgnify_msa_config,
+        self._small_bfd_msa_config,
+        self._uniprot_msa_config if multi_chain else None,
+    ):
+      if run_config is not None:
+        mmseqs_lib.MMseqs(
+            binary_path=run_config.config.binary_path,
+            database_path=run_config.config.database_config.path,
+            n_cpu=run_config.config.n_cpu,
+            e_value=run_config.config.e_value,
+            max_sequences=run_config.config.max_sequences,
+            sensitivity=run_config.config.sensitivity,
+            gpu=run_config.config.gpu,
+            uniprot_style_headers=run_config.config.uniprot_style_headers,
+            cache_dir=run_config.config.cache_dir,
+        ).query_many(sequences)
+
   def process_protein_chain(
       self, chain: folding_input.ProteinChain
   ) -> folding_input.ProteinChain:
@@ -479,11 +614,19 @@ class DataPipeline:
       # MSA None - search. Templates either [] - don't search, or None - search.
       unpaired_msa, paired_msa, template_hits = _get_protein_msa_and_templates(
           sequence=chain.sequence,
-          run_template_search=not has_templates,  # Skip template search if [].
+          run_template_search=(
+              not has_templates and not self._skip_templates
+          ),  # Skip template search if [].
           uniref90_msa_config=self._uniref90_msa_config,
           mgnify_msa_config=self._mgnify_msa_config,
           small_bfd_msa_config=self._small_bfd_msa_config,
-          uniprot_msa_config=self._uniprot_msa_config,
+          # The paired MSA is only used for multi-chain complexes. Skip its
+          # (costly) MMseqs2 search otherwise.
+          uniprot_msa_config=(
+              self._uniprot_msa_config
+              if not self._mmseqs or self._num_protein_chains > 1
+              else None
+          ),
           templates_config=self._templates_config,
           pdb_database_path=self._pdb_database_path,
       )
@@ -507,7 +650,7 @@ class DataPipeline:
       template_hits = _get_protein_templates(
           sequence=chain.sequence,
           input_msa_a3m=unpaired_msa,
-          run_template_search=True,
+          run_template_search=not self._skip_templates,
           templates_config=self._templates_config,
           pdb_database_path=self._pdb_database_path,
       )
@@ -573,6 +716,10 @@ class DataPipeline:
           query_sequence=chain.sequence, chain_poly_type=mmcif_names.RNA_CHAIN
       ).to_a3m()
       unpaired_msa = chain.unpaired_msa or empty_msa
+    elif self._skip_rna:
+      unpaired_msa = msa.Msa.from_empty(
+          query_sequence=chain.sequence, chain_poly_type=mmcif_names.RNA_CHAIN
+      ).to_a3m()
     else:
       unpaired_msa = _get_rna_msa(
           sequence=chain.sequence,
@@ -590,6 +737,11 @@ class DataPipeline:
 
   def process(self, fold_input: folding_input.Input) -> folding_input.Input:
     """Runs MSA and template tools and returns a new Input with the results."""
+    self._num_protein_chains = sum(
+        isinstance(chain, folding_input.ProteinChain)
+        for chain in fold_input.chains
+    )
+    self.prefetch_protein_msas(fold_input)
     processed_chains = []
     for chain in fold_input.chains:
       print(f'Running data pipeline for chain {chain.id}...')

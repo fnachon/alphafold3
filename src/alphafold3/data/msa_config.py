@@ -108,6 +108,37 @@ class NhmmerConfig:
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
+class MMseqsConfig:
+  """Configuration for MMseqs2 (CPU, or the CUDA/Metal GPU prefilter).
+
+  Attributes:
+      binary_path: Path to the mmseqs binary (use a build with the Metal or CUDA
+        GPU backend to run with `gpu=True`).
+      database_config: Database configuration. The path is an MMseqs2 database
+        (`mmseqs createdb`, or `makepaddedseqdb` for `gpu=True`).
+      n_cpu: Number of CPU threads (0 means all).
+      e_value: e-value for the database lookup.
+      max_sequences: Max sequences to return in MSA.
+      sensitivity: MMseqs2 `-s` sensitivity.
+      gpu: Whether to run the gapless prefilter on the GPU (`--gpu 1`).
+      uniprot_style_headers: Rewrite hit descriptions to the UniProt
+        `tr|ACC|ACC_SPECIES` form, so that species-based MSA pairing works for
+        UniRef-style databases whose headers carry a `RepID=ACC_SPECIES` field.
+      cache_dir: Optional directory to cache A3Ms by (sequence, settings).
+  """
+
+  binary_path: str
+  database_config: DatabaseConfig
+  n_cpu: int = 0
+  e_value: float = 1e-4
+  max_sequences: int = 10_000
+  sensitivity: float = 7.5
+  gpu: bool = True
+  uniprot_style_headers: bool = False
+  cache_dir: str | None = None
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
 class RunConfig:
   """Configuration for an MSA run.
 
@@ -119,7 +150,7 @@ class RunConfig:
       doesn't make sense to set this to less than 2.
   """
 
-  config: JackhmmerConfig | NhmmerConfig
+  config: JackhmmerConfig | NhmmerConfig | MMseqsConfig
   chain_poly_type: str
   crop_size: int | None
 

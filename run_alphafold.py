@@ -137,6 +137,63 @@ _HMMBUILD_BINARY_PATH = flags.DEFINE_string(
     'Path to the Hmmbuild binary.',
 )
 
+# MSA backend. "mmseqs" replaces Jackhmmer for protein MSAs, e.g. with the
+# MMseqs2 Metal GPU build on Apple Silicon.
+_MSA_BACKEND = flags.DEFINE_enum(
+    'msa_backend',
+    'hmmer',
+    ['hmmer', 'mmseqs'],
+    'Tool used for the protein MSA search. "hmmer" uses Jackhmmer (the AF3'
+    ' default). "mmseqs" uses MMseqs2 (see the --mmseqs_* flags); it needs'
+    ' MMseqs2 databases and, without HMMER installed, skips template and RNA'
+    ' MSA search.',
+)
+_MMSEQS_BINARY_PATH = flags.DEFINE_string(
+    'mmseqs_binary_path',
+    shutil.which('mmseqs'),
+    'Path to the mmseqs binary. Use a build with the Metal (Apple Silicon) or'
+    ' CUDA GPU backend to run with --mmseqs_gpu.',
+)
+_MMSEQS_UNIREF90_DATABASE_PATH = flags.DEFINE_string(
+    'mmseqs_uniref90_database_path',
+    '${DB_DIR}/mmseqs/uniref90_padded',
+    'MMseqs2 UniRef90 database used for the unpaired MSA. Must be a padded'
+    ' database (`mmseqs makepaddedseqdb`) when --mmseqs_gpu is set.',
+)
+_MMSEQS_UNIPROT_DATABASE_PATH = flags.DEFINE_string(
+    'mmseqs_uniprot_database_path',
+    None,
+    'Optional MMseqs2 UniProt database used for the paired MSA. If unset, the'
+    ' paired MSA is taken from the UniRef90 database.',
+)
+_MMSEQS_MGNIFY_DATABASE_PATH = flags.DEFINE_string(
+    'mmseqs_mgnify_database_path',
+    None,
+    'Optional MMseqs2 MGnify database added to the unpaired MSA.',
+)
+_MMSEQS_SMALL_BFD_DATABASE_PATH = flags.DEFINE_string(
+    'mmseqs_small_bfd_database_path',
+    None,
+    'Optional MMseqs2 small BFD database added to the unpaired MSA.',
+)
+_MMSEQS_GPU = flags.DEFINE_bool(
+    'mmseqs_gpu',
+    True,
+    'Run the MMseqs2 gapless prefilter on the GPU (Metal or CUDA).',
+)
+_MMSEQS_N_CPU = flags.DEFINE_integer(
+    'mmseqs_n_cpu', 0, 'MMseqs2 CPU threads. 0 uses all cores.', lower_bound=0
+)
+_MMSEQS_SENSITIVITY = flags.DEFINE_float(
+    'mmseqs_sensitivity', 7.5, 'MMseqs2 search sensitivity (-s).'
+)
+_MMSEQS_CACHE_DIR = flags.DEFINE_string(
+    'mmseqs_cache_dir',
+    None,
+    'Directory in which MMseqs2 MSAs are cached by sequence. Defaults to'
+    ' ~/.cache/alphafold3/mmseqs_msa.',
+)
+
 # Database paths.
 DB_DIR = flags.DEFINE_multi_string(
     'db_dir',
@@ -352,7 +409,7 @@ _JAX_BACKEND = flags.DEFINE_enum_class(
         ' only for inference which is much slower than using a GPU, but can be'
         ' useful for testing or running on systems without a GPU supported by'
         ' JAX. "mps" uses a GPU on Apple Silicon. If you set this flag to "cpu"'
-        ' or "mps", you must also set --flash_attention_implementation=xla.'
+        ' or "mps", --flash_attention_implementation defaults to xla.'
     ),
 )
 _BUCKETS = flags.DEFINE_list(
@@ -733,6 +790,15 @@ def write_outputs(
       writer.writerows(ranking_scores)
 
 
+def _flash_attention_implementation() -> str:
+  """Returns the attention implementation, defaulting to XLA off NVIDIA GPUs."""
+  if _JAX_BACKEND.value in {JaxBackend.CPU, JaxBackend.MPS} and not (
+      _FLASH_ATTENTION_IMPLEMENTATION.present
+  ):
+    return 'xla'
+  return _FLASH_ATTENTION_IMPLEMENTATION.value
+
+
 def replace_db_dir(
     path_with_db_dir: epath.PathLike, db_dirs: Sequence[str]
 ) -> str:
@@ -950,7 +1016,7 @@ def main(_):
   if _RUN_INFERENCE.value:
     # Fail early on incompatible devices, but only if we're running inference.
     if _JAX_BACKEND.value in {JaxBackend.CPU, JaxBackend.MPS}:
-      if _FLASH_ATTENTION_IMPLEMENTATION.value != 'xla':
+      if _flash_attention_implementation() != 'xla':
         raise ValueError(
             'For CPU-only or MPS inference, --flash_attention_implementation'
             ' must be set to "xla".'
@@ -982,7 +1048,7 @@ def main(_):
                 ' https://developer.nvidia.com/cuda-gpus) the ENV XLA_FLAGS'
                 f' must include "{required_flag}".'
             )
-          if _FLASH_ATTENTION_IMPLEMENTATION.value != 'xla':
+          if _flash_attention_implementation() != 'xla':
             raise ValueError(
                 'For devices with GPU compute capability 7.x (see'
                 ' https://developer.nvidia.com/cuda-gpus) the'
@@ -1007,6 +1073,41 @@ def main(_):
   max_template_date = datetime.date.fromisoformat(_MAX_TEMPLATE_DATE.value)
   if _RUN_DATA_PIPELINE.value:
     expand_path = lambda x: replace_db_dir(x, DB_DIR.value)
+    mmseqs_kwargs = {}
+    if _MSA_BACKEND.value == 'mmseqs':
+      # The HMMER databases are not needed (and usually absent) with MMseqs2.
+      def expand_path_if_exists(path):
+        try:
+          return replace_db_dir(path, DB_DIR.value)
+        except FileNotFoundError:
+          return os.fspath(path)
+
+      mmseqs_expand_path, expand_path = expand_path, expand_path_if_exists
+      if not _MMSEQS_BINARY_PATH.value:
+        raise ValueError(
+            '--msa_backend=mmseqs needs the mmseqs binary: put it on PATH or'
+            ' set --mmseqs_binary_path.'
+        )
+      optional_db = lambda x: mmseqs_expand_path(x) if x else None
+      mmseqs_kwargs = dict(
+          mmseqs_binary_path=_MMSEQS_BINARY_PATH.value,
+          mmseqs_uniref90_database_path=mmseqs_expand_path(
+              _MMSEQS_UNIREF90_DATABASE_PATH.value
+          ),
+          mmseqs_uniprot_database_path=optional_db(
+              _MMSEQS_UNIPROT_DATABASE_PATH.value
+          ),
+          mmseqs_mgnify_database_path=optional_db(
+              _MMSEQS_MGNIFY_DATABASE_PATH.value
+          ),
+          mmseqs_small_bfd_database_path=optional_db(
+              _MMSEQS_SMALL_BFD_DATABASE_PATH.value
+          ),
+          mmseqs_gpu=_MMSEQS_GPU.value,
+          mmseqs_n_cpu=_MMSEQS_N_CPU.value,
+          mmseqs_sensitivity=_MMSEQS_SENSITIVITY.value,
+          mmseqs_cache_dir=_MMSEQS_CACHE_DIR.value,
+      )
     data_pipeline_config = pipeline.DataPipelineConfig(
         jackhmmer_binary_path=_JACKHMMER_BINARY_PATH.value,  # pyrefly: ignore[bad-argument-type]
         nhmmer_binary_path=_NHMMER_BINARY_PATH.value,  # pyrefly: ignore[bad-argument-type]
@@ -1037,6 +1138,7 @@ def main(_):
         nhmmer_max_parallel_shards=_NHMMER_MAX_PARALLEL_SHARDS.value,
         hmmsearch_n_cpu=_HMMSEARCH_N_CPU.value,
         max_template_date=max_template_date,
+        **mmseqs_kwargs,
     )
   else:
     data_pipeline_config = None
@@ -1057,7 +1159,7 @@ def main(_):
         config=make_model_config(
             flash_attention_implementation=typing.cast(
                 tokamax.DotProductAttentionImplementation,
-                _FLASH_ATTENTION_IMPLEMENTATION.value,
+                _flash_attention_implementation(),
             ),
             num_diffusion_samples=_NUM_DIFFUSION_SAMPLES.value,
             num_recycles=_NUM_RECYCLES.value,

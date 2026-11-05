@@ -29,6 +29,7 @@ from alphafold3.cpp import msa_features
 from alphafold3.data import msa_config
 from alphafold3.data import parsers
 from alphafold3.data.tools import jackhmmer
+from alphafold3.data.tools import mmseqs
 from alphafold3.data.tools import msa_tool
 from alphafold3.data.tools import nhmmer
 import numpy as np
@@ -294,7 +295,11 @@ class Msa:
 
 
 def get_msa_tool(
-    msa_tool_config: msa_config.JackhmmerConfig | msa_config.NhmmerConfig,
+    msa_tool_config: (
+        msa_config.JackhmmerConfig
+        | msa_config.NhmmerConfig
+        | msa_config.MMseqsConfig
+    ),
 ) -> msa_tool.MsaTool:
   """Returns the requested MSA tool."""
 
@@ -323,6 +328,18 @@ def get_msa_tool(
           max_sequences=msa_tool_config.max_sequences,
           alphabet=msa_tool_config.alphabet,
           max_threads=msa_tool_config.max_parallel_shards,
+      )
+    case msa_config.MMseqsConfig():
+      return mmseqs.MMseqs(
+          binary_path=msa_tool_config.binary_path,
+          database_path=msa_tool_config.database_config.path,
+          n_cpu=msa_tool_config.n_cpu,
+          e_value=msa_tool_config.e_value,
+          max_sequences=msa_tool_config.max_sequences,
+          sensitivity=msa_tool_config.sensitivity,
+          gpu=msa_tool_config.gpu,
+          uniprot_style_headers=msa_tool_config.uniprot_style_headers,
+          cache_dir=msa_tool_config.cache_dir,
       )
     case _:
       raise ValueError(f'Unknown MSA tool: {msa_tool_config}.')
