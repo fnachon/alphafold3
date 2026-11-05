@@ -22,11 +22,11 @@
 from alphafold3.common import base_config
 from alphafold3.model import model_config
 from alphafold3.model.atom_layout import atom_layout
+from alphafold3.model.components import backend_ops
 from alphafold3.model.components import haiku_modules as hm
 import haiku as hk
 import jax
 from jax import numpy as jnp
-import tokamax
 
 
 def adaptive_layernorm(x, single_cond, name):
@@ -106,7 +106,9 @@ def transition_block(
         name=f'{name}ffw_transition1',
     )
     weights = jnp.reshape(weights, (len(weights), 2, num_intermediates))
-    c = tokamax.gated_linear_unit(x=x, weights=weights, activation=jax.nn.swish)
+    c = backend_ops.gated_linear_unit(
+        x=x, weights=weights, activation=jax.nn.swish
+    )
   else:
     x = hm.Linear(
         num_intermediates * 2, initializer='relu', name=f'{name}ffw_transition1'
