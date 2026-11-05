@@ -114,7 +114,10 @@ def gumbel_argsort_sample_idx(
   _, perm = jax.lax.sort_key_val(
       logits + z, iota, dimension=-1, is_stable=False
   )
-  return perm[::-1]
+  # Equivalent to `perm[::-1]`. A reversed vector used as gather indices is
+  # miscompiled by jax-mps (the gathered rows are wrong), so reverse with an
+  # explicit index computation, which gives the same result on every backend.
+  return jnp.take(perm, perm.shape[0] - 1 - jnp.arange(perm.shape[0]), axis=0)
 
 
 def create_msa_feat(msa: features.MSA) -> jax.Array:
