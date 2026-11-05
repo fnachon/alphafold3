@@ -1,1 +1,4 @@
 weights/
+__pycache__/
+.venv/
+src/alphafold3/constants/converters/*.msgpack
