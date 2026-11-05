@@ -545,16 +545,19 @@ resort to running AlphaFold 3 in the slow CPU-only mode even though it has a GPU
     make sure to set flags `--jax_backend="cpu"` and
     `--flash_attention_implementation="xla"`. If you are running on Mac OS with
     Apple Silicon, you can set `--jax_backend="mps"` instead and get roughly 3x
-    better inference performance by using the built-in GPU:
+    better inference performance by using the built-in GPU (see
+    [Running on Mac OS using the Apple Silicon GPU](#running-on-mac-os-using-the-apple-silicon-gpu)):
 
     ```sh
     uv run run_alphafold.py \
       --json_path="..." \
       --output_dir="..." \
       --model_dir="..." \
-      --jax_backend="cpu" \
-      --flash_attention_implementation="xla"
+      --jax_backend="cpu"
     ```
+
+    `--flash_attention_implementation` defaults to `xla` for the `cpu` and `mps`
+    backends unless you set it explicitly.
 
 #### Running on Mac OS using the Apple Silicon GPU
 
@@ -562,3 +565,68 @@ As an alternative to CPU-only mode, AlphaFold 3 inference can run on the Apple
 Silicon GPU with `--jax_backend="mps"` via the community supported `jax-mps`
 Metal plugin. This is an unofficial and experimental path, but it is roughly 3×
 faster than CPU (possibly more on newer M chips).
+
+Inference with the `mps` backend needs `jax-mps` (installed by `uv sync` on
+arm64 macOS) and the default `--flash_attention_implementation=xla`, which is
+picked automatically.
+
+On MPS the model does not call tokamax (which has no Metal kernels and raises
+`KeyError: 'mps'` for float32). `alphafold3.model.components.backend_ops`
+dispatches to plain JAX instead, and to jax-mps's fused MLX `sdpa` Metal kernel
+for attention. Set `AF3_MPS_FUSED_ATTENTION=0` to use plain JAX attention.
+CUDA and CPU keep using tokamax unchanged.
+
+Measured on an Apple Silicon Mac against the CPU backend (same input MSA and
+seed, 1 diffusion sample, structures superimposed):
+
+| Input | Tokens | CPU | MPS | CPU vs MPS |
+|---|---|---|---|---|
+| ubiquitin (3 recycles) | 76 | 53 s | 16 s | 0.36 Å RMSD, pTM 0.84 / 0.83 |
+| barnase-barstar (10 recycles) | 199 | 340 s | 30 s | 0.05 Å RMSD, ipTM 0.93 / 0.93 |
+
+Times are for model inference only (compilation included), not the data
+pipeline.
+
+jax-mps 0.10.9 miscompiles a gather whose indices come from a reversed vector
+(`rows[idx[::-1]]` returns wrong rows under `jit`). AlphaFold 3 hit this when
+shuffling MSA rows, which silently gave a different MSA to the trunk (ipTM 0.22
+instead of 0.93 on barnase-barstar). `featurization.gumbel_argsort_sample_idx`
+avoids the pattern. If you add JAX code for this backend, compare it against
+the CPU backend on a multi-chain input before trusting it.
+
+##### MSAs with MMseqs2 (Metal GPU)
+
+Jackhmmer is slow and HMMER has no GPU path. On Apple Silicon you can search
+the protein MSA with an [MMseqs2 build with the Metal GPU
+backend](https://github.com/milot-mirdita/mmseqs2/tree/metal-gpu-backend)
+instead, using `--msa_backend=mmseqs`:
+
+```sh
+# One-off: make a padded UniRef90 database (required by --mmseqs_gpu).
+mmseqs createdb uniref90.fa uniref90_db
+mmseqs makepaddedseqdb uniref90_db ${DB_DIR}/mmseqs/uniref90_padded
+
+uv run run_alphafold.py \
+  --json_path="..." --output_dir="..." --model_dir="..." \
+  --jax_backend="mps" \
+  --msa_backend="mmseqs" \
+  --mmseqs_binary_path="/path/to/mmseqs" \
+  --db_dir="${DB_DIR}"   # uses ${DB_DIR}/mmseqs/uniref90_padded
+```
+
+*   The unpaired MSA comes from `--mmseqs_uniref90_database_path` and, if given,
+    `--mmseqs_mgnify_database_path` and `--mmseqs_small_bfd_database_path`.
+*   For multi-chain inputs the paired MSA comes from
+    `--mmseqs_uniprot_database_path`, or from the UniRef90 database if unset.
+    Hit descriptions are rewritten to `tr|ACC|ACC_SPECIES` from the `RepID=`
+    field so that species pairing works. Single-chain inputs skip it.
+*   All protein chains of an input are searched in one MMseqs2 run, and the
+    A3Ms are cached by sequence in `--mmseqs_cache_dir`
+    (`~/.cache/alphafold3/mmseqs_msa`). Loading the database dominates the
+    time (about 70 s for UniRef90 on an M-series Mac) so batch your inputs.
+*   Use `--nommseqs_gpu` to search on the CPU with a normal (non-padded)
+    database.
+*   Without HMMER installed (`brew install hmmer`), template search and RNA MSA
+    search are skipped, and the model runs without templates. Results are then
+    not directly comparable to the standard AlphaFold 3 pipeline: MMseqs2 and
+    UniRef90 give different MSAs than Jackhmmer on the full set of databases.
