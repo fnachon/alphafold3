@@ -142,7 +142,7 @@ requires-dist = [
     { name = "gcsfs", marker = "extra == 'gcsfs'" },
     { name = "jax", specifier = "==0.10.2" },
     { name = "jax", extras = ["cuda12"], marker = "sys_platform != 'darwin'", specifier = "==0.10.2" },
-    { name = "jax-mps", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'", specifier = "==0.10.9" },
+    { name = "jax-mps", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'", specifier = "==0.10.11" },
     { name = "msgpack" },
     { name = "numpy" },
     { name = "rdkit", specifier = "==2026.3.3" },
@@ -751,14 +751,14 @@ with-cuda = [
 
 [[package]]
 name = "jax-mps"
-version = "0.10.9"
+version = "0.10.11"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "jax", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'" },
     { name = "jaxlib", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'" },
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/70/34/7f01c633b3ba61d0beaacf3bce238b1c7110bcfcf8b2e924ac3aba0d9be9/jax_mps-0.10.9-py3-none-macosx_14_0_arm64.whl", hash = "sha256:6b289db0bea58f9c11b7b09b73626d9ee0cb4b8268e2f88dca01286159fec3eb", size = 44034532, upload-time = "2026-07-10T03:50:16.636Z" },
+    { url = "https://files.pythonhosted.org/packages/5c/65/a7ff35c04c8d72acc6e7147af3fb452b4a236c2500c3d23a5086d829f71f/jax_mps-0.10.11-py3-none-macosx_14_0_arm64.whl", hash = "sha256:5b777da81b48a5c9504ad40e16747083a61ccf8edd45a65e749831edf39b0e35", size = 44833797, upload-time = "2026-09-13T13:50:58.241Z" },
 ]
 
 [[package]]

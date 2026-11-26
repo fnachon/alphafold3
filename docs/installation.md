@@ -587,12 +587,14 @@ seed, 1 diffusion sample, structures superimposed):
 Times are for model inference only (compilation included), not the data
 pipeline.
 
-jax-mps 0.10.9 miscompiles a gather whose indices come from a reversed vector
+Use `jax-mps` 0.10.11 or later (this fork pins 0.10.11). Versions 0.10.9 and
+0.10.10 miscompile a gather whose indices come from a reversed vector
 (`rows[idx[::-1]]` returns wrong rows under `jit`). AlphaFold 3 hit this when
 shuffling MSA rows, which silently gave a different MSA to the trunk (ipTM 0.22
 instead of 0.93 on barnase-barstar). `featurization.gumbel_argsort_sample_idx`
-avoids the pattern. If you add JAX code for this backend, compare it against
-the CPU backend on a multi-chain input before trusting it.
+also avoids the pattern, so older installs are safe there. If you add JAX code
+for this backend, compare it against the CPU backend on a multi-chain input
+before trusting it.
 
 ##### MSAs with MMseqs2 (Metal GPU)
 

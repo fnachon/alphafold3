@@ -115,8 +115,8 @@ def gumbel_argsort_sample_idx(
       logits + z, iota, dimension=-1, is_stable=False
   )
   # Equivalent to `perm[::-1]`. A reversed vector used as gather indices is
-  # miscompiled by jax-mps (the gathered rows are wrong), so reverse with an
-  # explicit index computation, which gives the same result on every backend.
+  # miscompiled by jax-mps < 0.10.11 (the gathered rows are wrong), so reverse
+  # with an explicit index computation, which gives the same result everywhere.
   return jnp.take(perm, perm.shape[0] - 1 - jnp.arange(perm.shape[0]), axis=0)
 
 
